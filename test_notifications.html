@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dating App - Debug Notifications</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .test-result { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        .warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; }
+        button:hover { background: #0056b3; }
+        pre { background: #f8f9fa; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        .loading { animation: spin 1s linear infinite; display: inline-block; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .ip-input { padding: 8px; border: 1px solid #ddd; border-radius: 4px; width: 200px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔔 Dating App - Notification Debug Tool</h1>
+        <p>This tool will help diagnose why notifications aren't working on this laptop.</p>
+        
+        <div style="margin: 20px 0; padding: 15px; background: #e9ecef; border-radius: 5px;">
+            <label><strong>Backend IP Address:</strong></label>
+            <input type="text" id="backendIP" class="ip-input" value="10.101.83.3" placeholder="10.101.83.3">
+            <button onclick="updateBackendURL()">Update & Test</button>
+            <p style="font-size: 12px; color: #666; margin-top: 5px;">
+                Current backend URL: <span id="currentURL">http://10.101.83.3:8004</span>
+            </p>
+        </div>
+
+        <button onclick="runAllTests()">🔍 Run All Tests</button>
+        <button onclick="clearResults()">🧹 Clear Results</button>
+        
+        <div id="results"></div>
+        
+        <div style="margin-top: 30px; padding: 15px; background: #f8f9fa; border-radius: 5px;">
+            <h3>🛠️ Quick Fixes</h3>
+            <ul>
+                <li><strong>Different Network?</strong> Make sure both laptops are on the same WiFi</li>
+                <li><strong>Wrong IP?</strong> Update the IP address above and test again</li>
+                <li><strong>Firewall?</strong> Try disabling firewall temporarily on backend laptop</li>
+                <li><strong>Backend Not Running?</strong> Make sure the backend server is running on the other laptop</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        let backendURL = 'http://10.101.83.3:8004';
+        
+        function updateBackendURL() {
+            const ip = document.getElementById('backendIP').value.trim();
+            backendURL = `http://${ip}:8004`;
+            document.getElementById('currentURL').textContent = backendURL;
+            addResult('info', `Updated backend URL to: ${backendURL}`);
+        }
+        
+        function addResult(type, message) {
+            const results = document.getElementById('results');
+            const div = document.createElement('div');
+            div.className = `test-result ${type}`;
+            div.innerHTML = message;
+            results.appendChild(div);
+        }
+        
+        function clearResults() {
+            document.getElementById('results').innerHTML = '';
+        }
+        
+        async function runAllTests() {
+            clearResults();
+            addResult('info', '🔍 Starting network diagnostics...');
+            
+            // Test 1: Basic connectivity
+            await testBasicConnectivity();
+            
+            // Test 2: Authentication
+            await testAuthentication();
+            
+            // Test 3: Pending calls endpoint
+            await testPendingCalls();
+            
+            // Test 4: Notification polling simulation
+            await testNotificationPolling();
+            
+            addResult('info', '✅ All tests completed!');
+        }
+        
+        async function testBasicConnectivity() {
+            addResult('info', '📡 Test 1: Basic Backend Connectivity...');
+            
+            try {
+                const response = await fetch(`${backendURL}/health`);
+                if (response.ok) {
+                    const data = await response.json();
+                    addResult('success', `✅ Backend is reachable! Response: ${JSON.stringify(data)}`);
+                } else {
+                    addResult('error', `❌ Backend responded with error: ${response.status}`);
+                }
+            } catch (error) {
+                addResult('error', `❌ Cannot connect to backend: ${error.message}<br>
+                    <strong>Solutions:</strong><br>
+                    • Check if both laptops are on the same WiFi<br>
+                    • Make sure backend is running: python3 main_fixed.py<br>
+                    • Try updating the IP address above<br>
+                    • Check firewall settings`);
+            }
+        }
+        
+        async function testAuthentication() {
+            addResult('info', '🔑 Test 2: Authentication Status...');
+            
+            const token = localStorage.getItem('token');
+            if (!token) {
+                addResult('warning', '⚠️ No JWT token found. Please log in to the dating app first.');
+                return;
+            }
+            
+            addResult('success', '✅ JWT Token found in localStorage');
+            
+            try {
+                const response = await fetch(`${backendURL}/api/auth/me`, {
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                if (response.ok) {
+                    const userData = await response.json();
+                    addResult('success', `✅ Authentication working for: ${userData.email}`);
+                } else {
+                    addResult('error', `❌ Authentication failed: ${response.status}`);
+                }
+            } catch (error) {
+                addResult('error', `❌ Auth request failed: ${error.message}`);
+            }
+        }
+        
+        async function testPendingCalls() {
+            addResult('info', '📞 Test 3: Pending Calls Endpoint...');
+            
+            const token = localStorage.getItem('token');
+            if (!token) {
+                addResult('warning', '⚠️ Cannot test - please log in first');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${backendURL}/api/video/pending-calls`, {
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    addResult('success', `✅ Pending calls endpoint working!`);
+                    
+                    if (data.pending_calls && data.pending_calls.length > 0) {
+                        addResult('success', `🔔 NOTIFICATIONS SHOULD BE WORKING! Found ${data.pending_calls.length} pending calls:<br>
+                            <pre>${JSON.stringify(data.pending_calls, null, 2)}</pre>`);
+                    } else {
+                        addResult('info', 'ℹ️ No pending calls right now. Start a video call from another device to test notifications.');
+                    }
+                } else {
+                    addResult('error', `❌ Pending calls endpoint failed: ${response.status}`);
+                }
+            } catch (error) {
+                addResult('error', `❌ Pending calls request failed: ${error.message}`);
+            }
+        }
+        
+        async function testNotificationPolling() {
+            addResult('info', '⏱️ Test 4: Notification Polling Simulation (3 polls)...');
+            
+            const token = localStorage.getItem('token');
+            if (!token) {
+                addResult('warning', '⚠️ Cannot test - please log in first');
+                return;
+            }
+            
+            for (let i = 1; i <= 3; i++) {
+                try {
+                    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+                    const response = await fetch(`${backendURL}/api/video/pending-calls`, {
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        addResult('success', `Poll ${i}/3: ✅ Success - ${data.pending_calls.length} pending calls`);
+                    } else {
+                        addResult('error', `Poll ${i}/3: ❌ Failed - ${response.status}`);
+                    }
+                } catch (error) {
+                    addResult('error', `Poll ${i}/3: ❌ Error - ${error.message}`);
+                }
+            }
+        }
+        
+        // Auto-update URL on page load
+        updateBackendURL();
+    </script>
+</body>
+</html>
