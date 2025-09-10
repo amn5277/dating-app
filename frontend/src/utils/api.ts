@@ -1,8 +1,8 @@
 import axios from 'axios';
 import { useAuthStore } from '../store/auth';
 
-// API URL Configuration - Restored to working HTTP URL
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://172.16.0.222:8004';
+// API URL Configuration - Updated to correct backend endpoint
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'https://justanotherdatingapp-production.up.railway.app';
 
 // Create axios instance
 const api = axios.create({

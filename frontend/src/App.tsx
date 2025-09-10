@@ -19,8 +19,10 @@ import DebugAuthState from './components/DebugAuthState';
 
 // Helper to get API URL for debugging
 const getApiBaseUrl = () => {
-  return process.env.REACT_APP_API_URL || 'http://10.101.83.3:8004';
+  return process.env.REACT_APP_API_URL || 'https://justanotherdatingapp-production.up.railway.app';
 };
+
+
 
 function App() {
   const { isAuthenticated, token, user, profile, isLoading, setUser, setProfile, setLoading } = useAuthStore();

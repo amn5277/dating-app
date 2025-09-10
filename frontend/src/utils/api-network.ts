@@ -4,8 +4,8 @@
 import axios from 'axios';
 import { useAuthStore } from '../store/auth';
 
-// Restored to working HTTP URL  
-const API_BASE_URL = 'http://10.101.83.3:8004'; // <-- Working backend URL
+// Updated to correct backend endpoint  
+const API_BASE_URL = 'https://justanotherdatingapp-production.up.railway.app'; // <-- Deployed backend URL
 
 // Create axios instance
 const api = axios.create({
