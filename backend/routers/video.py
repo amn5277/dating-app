@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
@@ -6,7 +6,7 @@ from sqlalchemy import and_, or_
 from pydantic import BaseModel
 import asyncio
 
-from database import get_db, User, Match, VideoSession, video_participants
+from database import get_db, User, Match, VideoSession, InstantCallSession, MatchingSession, video_participants
 from routers.auth import get_current_user
 
 router = APIRouter()
@@ -15,7 +15,7 @@ router = APIRouter()
 class VideoSessionResponse(BaseModel):
     id: int
     session_id: str
-    match_id: int
+    match_id: Optional[int]  # Can be None for instant call sessions in continuous matching
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     duration: int
@@ -51,7 +51,7 @@ def create_video_session(db: Session, match: Match) -> VideoSession:
     video_session = VideoSession(
         session_id=match.video_session_id,
         match_id=match.id,
-        duration=60,  # 1 minute
+        duration=180,  # 3 minutes - more time for WebRTC connection
         status="waiting"
     )
     
@@ -123,10 +123,21 @@ def end_video_session(db: Session, session_id: str) -> Optional[VideoSession]:
         return session
     return None
 
-async def auto_end_session(session_id: str, db: Session):
+async def auto_end_session(session_id: str):
     """Automatically end session after 1 minute"""
     await asyncio.sleep(60)  # Wait 1 minute
-    end_video_session(db, session_id)
+    
+    # Create a new database session for this background task
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        end_video_session(db, session_id)
+        print(f"🕒 Auto-ended session {session_id} after 1 minute")
+    except Exception as e:
+        print(f"❌ Error auto-ending session {session_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()  # Critical: Always close the session
 
 # Routes
 @router.post("/start-call", response_model=VideoSessionResponse)
@@ -236,10 +247,88 @@ async def get_video_session(
     if not session:
         raise HTTPException(status_code=404, detail="Video session not found")
     
-    # Check if user is part of this session
-    match = db.query(Match).filter(Match.id == session.match_id).first()
-    if not match or current_user.id not in [match.user_id, match.matched_user_id]:
-        raise HTTPException(status_code=403, detail="Not authorized for this session")
+    # Check if this is a regular match or instant call session
+    if session.match_id:
+        # Regular match - check authorization normally
+        match = db.query(Match).filter(Match.id == session.match_id).first()
+        if not match or current_user.id not in [match.user_id, match.matched_user_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+    else:
+        # Instant call session - check authorization and validate active matching
+        call_session = db.query(InstantCallSession).filter(InstantCallSession.session_id == session_id).first()
+        
+        if not call_session:
+            raise HTTPException(status_code=404, detail="Call session not found")
+        
+        # Check if user is part of this call session
+        if current_user.id not in [call_session.user1_id, call_session.user2_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+        
+        # 🎯 CRITICAL: Validate both users still have active matching sessions
+        now = datetime.now(timezone.utc)
+        active_cutoff = now - timedelta(minutes=30)  # Must be active within last 30 minutes (more lenient for video calls)
+        
+        user1_active = db.query(MatchingSession).filter(
+            and_(
+                MatchingSession.user_id == call_session.user1_id,
+                MatchingSession.status == "active",
+                MatchingSession.last_active >= active_cutoff
+            )
+        ).first()
+        
+        user2_active = db.query(MatchingSession).filter(
+            and_(
+                MatchingSession.user_id == call_session.user2_id,
+                MatchingSession.status == "active",
+                MatchingSession.last_active >= active_cutoff
+            )
+        ).first()
+        
+        # 🎯 PROACTIVE FIX: Update both users' matching sessions since they're accessing the video call
+        # This prevents race conditions where last_active appears stale due to navigation timing
+        current_time = datetime.now(timezone.utc)
+        
+        if user1_active:
+            user1_active.last_active = current_time
+        if user2_active:
+            user2_active.last_active = current_time
+            
+        # If either user is not actively matching, cancel the call session
+        if not user1_active or not user2_active:
+            call_session.status = "cancelled"
+            session.status = "cancelled"
+            db.commit()
+            
+            inactive_user = "user1" if not user1_active else "user2"
+            print(f"🚫 Cancelled call session {call_session.id} - {inactive_user} no longer actively matching")
+            print(f"🔍 Debug - User1 active: {bool(user1_active)}, User2 active: {bool(user2_active)}")
+            print(f"🔍 Active cutoff time: {active_cutoff}")
+            
+            # Get detailed info about why each user failed validation
+            user1_sessions = db.query(MatchingSession).filter(MatchingSession.user_id == call_session.user1_id).all()
+            user2_sessions = db.query(MatchingSession).filter(MatchingSession.user_id == call_session.user2_id).all()
+            
+            print(f"🔍 User 1 matching sessions:")
+            for session in user1_sessions:
+                print(f"  📋 Session {session.session_id[:8]}: status={session.status}, last_active={session.last_active}")
+                if session.last_active:
+                    time_diff = now - session.last_active
+                    print(f"      ⏱️  Time since active: {time_diff.total_seconds():.1f} seconds")
+                    print(f"      ✅ Meets cutoff: {session.last_active >= active_cutoff}")
+            
+            print(f"🔍 User 2 matching sessions:")
+            for session in user2_sessions:
+                print(f"  📋 Session {session.session_id[:8]}: status={session.status}, last_active={session.last_active}")
+                if session.last_active:
+                    time_diff = now - session.last_active  
+                    print(f"      ⏱️  Time since active: {time_diff.total_seconds():.1f} seconds")
+                    print(f"      ✅ Meets cutoff: {session.last_active >= active_cutoff}")
+            
+            raise HTTPException(status_code=410, detail="Call cancelled - other user is no longer actively matching")
+        else:
+            # Both users are active - commit the updated timestamps
+            db.commit()
+            print(f"✅ Both users active for call session {call_session.id} - updated matching session timestamps")
     
     return session
 
@@ -255,10 +344,24 @@ async def end_video_call(
     if not session:
         raise HTTPException(status_code=404, detail="Video session not found")
     
-    # Check if user is part of this session
-    match = db.query(Match).filter(Match.id == session.match_id).first()
-    if not match or current_user.id not in [match.user_id, match.matched_user_id]:
-        raise HTTPException(status_code=403, detail="Not authorized for this session")
+    # Check authorization - handle both regular matches and instant call sessions
+    if session.match_id:
+        # Regular match - check authorization normally
+        match = db.query(Match).filter(Match.id == session.match_id).first()
+        if not match or current_user.id not in [match.user_id, match.matched_user_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+    else:
+        # Instant call session - check authorization differently
+        call_session = db.query(InstantCallSession).filter(InstantCallSession.session_id == session_id).first()
+        
+        if not call_session:
+            raise HTTPException(status_code=404, detail="Call session not found")
+        
+        # Check if user is part of this call session
+        if current_user.id not in [call_session.user1_id, call_session.user2_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+            
+        print(f"✅ End call authorization passed for instant call session {call_session.id} - User {current_user.id}")
     
     if session.status != "active":
         raise HTTPException(status_code=400, detail="Session is not active")
@@ -282,19 +385,47 @@ async def webrtc_signal(
     if not session:
         raise HTTPException(status_code=404, detail="Video session not found")
     
-    match = db.query(Match).filter(Match.id == session.match_id).first()
-    if not match or current_user.id not in [match.user_id, match.matched_user_id]:
-        raise HTTPException(status_code=403, detail="Not authorized for this session")
+    # Check authorization - handle both regular matches and instant call sessions
+    if session.match_id:
+        # Regular match - check authorization normally
+        match = db.query(Match).filter(Match.id == session.match_id).first()
+        if not match or current_user.id not in [match.user_id, match.matched_user_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+        
+        # For regular matches, get the other user for auto-targeting
+        other_user_id = match.matched_user_id if match.user_id == current_user.id else match.user_id
+    else:
+        # Instant call session - check authorization differently
+        call_session = db.query(InstantCallSession).filter(InstantCallSession.session_id == signal.session_id).first()
+        
+        if not call_session:
+            raise HTTPException(status_code=404, detail="Call session not found")
+        
+        # Check if user is part of this call session
+        if current_user.id not in [call_session.user1_id, call_session.user2_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+            
+        print(f"✅ Send signal authorization passed for instant call session {call_session.id} - User {current_user.id}")
+        
+        # For instant calls, get the other user for auto-targeting
+        other_user_id = call_session.user2_id if call_session.user1_id == current_user.id else call_session.user1_id
     
     # Store signal for the target user
     if signal.session_id not in webrtc_signals:
         webrtc_signals[signal.session_id] = []
     
+    # If target_user_id is 0, automatically determine the other user
+    target_user_id = signal.target_user_id
+    if target_user_id == 0:
+        # Use the other_user_id we determined above (works for both regular matches and instant calls)
+        target_user_id = other_user_id
+        print(f"📡 Auto-setting target_user_id from 0 to {target_user_id} for signal type: {signal.type}")
+    
     webrtc_signals[signal.session_id].append({
         "type": signal.type,
         "data": signal.data,
         "from_user_id": current_user.id,
-        "target_user_id": signal.target_user_id,
+        "target_user_id": target_user_id,
         "timestamp": datetime.utcnow().isoformat()
     })
     
@@ -333,9 +464,24 @@ async def get_webrtc_signals(
     if not session:
         raise HTTPException(status_code=404, detail="Video session not found")
     
-    match = db.query(Match).filter(Match.id == session.match_id).first()
-    if not match or current_user.id not in [match.user_id, match.matched_user_id]:
-        raise HTTPException(status_code=403, detail="Not authorized for this session")
+    # Check authorization - handle both regular matches and instant call sessions
+    if session.match_id:
+        # Regular match - check authorization normally
+        match = db.query(Match).filter(Match.id == session.match_id).first()
+        if not match or current_user.id not in [match.user_id, match.matched_user_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+    else:
+        # Instant call session - check authorization differently
+        call_session = db.query(InstantCallSession).filter(InstantCallSession.session_id == session_id).first()
+        
+        if not call_session:
+            raise HTTPException(status_code=404, detail="Call session not found")
+        
+        # Check if user is part of this call session
+        if current_user.id not in [call_session.user1_id, call_session.user2_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+            
+        print(f"✅ Signals authorization passed for instant call session {call_session.id} - User {current_user.id}")
     
     # Get signals targeted to current user
     if session_id in webrtc_signals:
@@ -461,6 +607,51 @@ async def get_pending_calls(
                         "call_type": "Repeat Call 💕" if match.status == "matched" else "First Call"
                     })
     
+    # 🎯 CRITICAL FIX: Also check for instant call sessions from continuous matching
+    instant_calls = db.query(InstantCallSession).filter(
+        and_(
+            or_(
+                InstantCallSession.user1_id == current_user.id,
+                InstantCallSession.user2_id == current_user.id
+            ),
+            InstantCallSession.status.in_(["waiting", "active"])
+        )
+    ).all()
+    
+    for call_session in instant_calls:
+        # Get video session for this call
+        video_session = db.query(VideoSession).filter(
+            VideoSession.session_id == call_session.session_id
+        ).first()
+        
+        if video_session and video_session.status in ["waiting", "active"]:
+            # Check if current user has already joined this session
+            user_already_joined = (
+                video_session.session_id in connected_users and 
+                current_user.id in connected_users[video_session.session_id]
+            )
+            
+            if not user_already_joined:
+                # Get the other user's information
+                other_user_id = call_session.user2_id if call_session.user1_id == current_user.id else call_session.user1_id
+                other_user = db.query(User).filter(User.id == other_user_id).first()
+                other_user_name = other_user.profile.name if other_user and other_user.profile else "Unknown"
+                
+                # Calculate how long ago the call started
+                time_since_start = 0
+                if video_session.started_at:
+                    time_since_start = int((datetime.utcnow() - video_session.started_at).total_seconds())
+                
+                pending_calls.append({
+                    "session_id": video_session.session_id,
+                    "match_id": 0,  # No match_id for instant calls
+                    "other_user_name": other_user_name,
+                    "is_mutual_match": False,  # Instant calls are not mutual matches yet
+                    "started_at": video_session.started_at,
+                    "seconds_ago": time_since_start,
+                    "call_type": "Instant Match 🚀"
+                })
+    
     return {"pending_calls": pending_calls}
 
 @router.get("/call-history/{match_id}")
@@ -520,10 +711,50 @@ async def join_video_call(
     if not session:
         raise HTTPException(status_code=404, detail="Video session not found")
     
-    # Get the match to check authorization
-    match = get_match_by_id(db, session.match_id)
-    if not match or current_user.id not in [match.user_id, match.matched_user_id]:
-        raise HTTPException(status_code=403, detail="Not authorized for this video session")
+    # Check authorization - handle both regular matches and instant call sessions
+    if session.match_id:
+        # Regular match - check authorization normally
+        match = get_match_by_id(db, session.match_id)
+        if not match or current_user.id not in [match.user_id, match.matched_user_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this video session")
+        expected_users = {match.user_id, match.matched_user_id}
+    else:
+        # Instant call session - check authorization differently
+        call_session = db.query(InstantCallSession).filter(InstantCallSession.session_id == session_id).first()
+        
+        if not call_session:
+            raise HTTPException(status_code=404, detail="Call session not found")
+        
+        # Check if user is part of this call session
+        if current_user.id not in [call_session.user1_id, call_session.user2_id]:
+            raise HTTPException(status_code=403, detail="Not authorized for this session")
+        
+        expected_users = {call_session.user1_id, call_session.user2_id}
+        
+        # 🎯 PROACTIVE FIX: Update matching sessions for instant calls
+        current_time = datetime.now(timezone.utc)
+        
+        user1_session = db.query(MatchingSession).filter(
+            and_(
+                MatchingSession.user_id == call_session.user1_id,
+                MatchingSession.status == "active"
+            )
+        ).first()
+        
+        user2_session = db.query(MatchingSession).filter(
+            and_(
+                MatchingSession.user_id == call_session.user2_id,
+                MatchingSession.status == "active"
+            )
+        ).first()
+        
+        if user1_session:
+            user1_session.last_active = current_time
+        if user2_session:
+            user2_session.last_active = current_time
+            
+        db.commit()
+        print(f"✅ Updated matching sessions for instant call join - User {current_user.id} joining session {session_id}")
     
     # Track this user as connected
     if session_id not in connected_users:
@@ -533,7 +764,6 @@ async def join_video_call(
     print(f"👥 User {current_user.id} joined session {session_id}. Connected users: {connected_users[session_id]}")
     
     # Check if both users are now connected
-    expected_users = {match.user_id, match.matched_user_id}
     connected_session_users = connected_users[session_id]
     
     if expected_users.issubset(connected_session_users) and session.status == "waiting":
@@ -545,7 +775,7 @@ async def join_video_call(
         db.commit()
         
         # Now schedule auto-end after 1 minute
-        background_tasks.add_task(auto_end_session, session_id, db)
+        background_tasks.add_task(auto_end_session, session_id)
         
         return {
             "message": "Video call started! Both users connected.",

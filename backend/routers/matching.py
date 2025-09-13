@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, not_
 from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
 
 from database import get_db, User, Profile, Match, Interest, VideoSession, user_interests
 from routers.auth import get_current_user
@@ -133,8 +134,6 @@ def find_potential_matches(db: Session, user: User, limit: int = 10) -> List[Use
     existing_match_ids.discard(user.id)  # Remove current user ID
     
     # Query for potential matches, ordered by recent activity
-    from datetime import datetime, timedelta
-    
     # Get more users to filter and rank, prioritizing recently active ones
     query = db.query(User).join(Profile).filter(
         and_(
@@ -166,7 +165,7 @@ def find_potential_matches(db: Session, user: User, limit: int = 10) -> List[Use
         )
         
         # Add bonus for recently active users
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if potential_match.last_active:
             time_since_active = now - potential_match.last_active
             
@@ -263,14 +262,14 @@ async def get_user_matches(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get all matches for the current user (excluding unmatched)"""
+    """Get all ACTUAL matches for the current user (only mutual matches after video call + mutual yes)"""
     matches = db.query(Match).filter(
         and_(
             or_(
                 Match.user_id == current_user.id,
                 Match.matched_user_id == current_user.id
             ),
-            Match.status != "unmatched"  # Exclude unmatched matches
+            Match.status == "matched"  # Only show mutual matches (both said yes)
         )
     ).all()
     
@@ -404,9 +403,8 @@ async def get_active_users(
     db: Session = Depends(get_db)
 ):
     """Get information about currently active users"""
-    from datetime import datetime, timedelta
     
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     
     # Count users by activity level
     active_10min = db.query(User).filter(

@@ -122,4 +122,18 @@ export const continuousMatchingAPI = {
     api.post(`/api/continuous-matching/end-session/${sessionId}`),
 };
 
+export const personalityRatingsAPI = {
+  submitRating: (ratingData: any) =>
+    api.post('/api/personality-ratings/submit', ratingData),
+  
+  getUserSummary: (userId: number) =>
+    api.get(`/api/personality-ratings/user/${userId}/summary`),
+  
+  getMyRatingsGiven: () =>
+    api.get('/api/personality-ratings/my-ratings-given'),
+  
+  getMyRatingsReceived: () =>
+    api.get('/api/personality-ratings/my-ratings-received'),
+};
+
 export default api;

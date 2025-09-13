@@ -31,12 +31,22 @@ const PendingCallsNotification: React.FC<PendingCallsNotificationProps> = ({
         const response = await videoAPI.getPendingCalls();
         const calls = response.data.pending_calls || [];
         
-        // Remove duplicates by match_id (keep most recent session per match)
+        // Remove duplicates - for regular matches use match_id, for instant calls use session_id
         const uniqueCalls = calls.reduce((unique: PendingCall[], call: PendingCall) => {
-          const existingCall = unique.find(c => c.match_id === call.match_id);
+          // For instant calls (match_id = 0), use session_id as identifier
+          // For regular matches, use match_id as identifier
+          const identifier = call.match_id === 0 ? call.session_id : call.match_id;
+          const existingCall = unique.find(c => {
+            const existingId = c.match_id === 0 ? c.session_id : c.match_id;
+            return existingId === identifier;
+          });
+          
           if (!existingCall || call.started_at > existingCall.started_at) {
             // Remove the old call if exists and add the new one
-            const filtered = unique.filter(c => c.match_id !== call.match_id);
+            const filtered = unique.filter(c => {
+              const filteredId = c.match_id === 0 ? c.session_id : c.match_id;
+              return filteredId !== identifier;
+            });
             filtered.push(call);
             return filtered;
           }

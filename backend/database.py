@@ -11,13 +11,25 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dating_app.db")
 
 # Fix Railway PostgreSQL URLs that use postgres:// instead of postgresql://
+# and configure to use pg8000 driver (pure Python, no compilation required)
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+pg8000://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+pg8000://", 1)
 
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    engine = create_engine(DATABASE_URL)
+    # Production PostgreSQL with reasonable connection pooling
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=10,           # Reasonable pool size for Railway
+        max_overflow=20,        # Allow up to 20 overflow connections (30 total)
+        pool_timeout=30,        # Wait up to 30 seconds for a connection
+        pool_recycle=1800,      # Recycle connections every 30 minutes
+        pool_pre_ping=True,     # Validate connections before use
+        echo=False              # Disable SQL logging in production
+    )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -49,6 +61,10 @@ class User(Base):
     
     # Matching sessions for continuous matching
     matching_sessions = relationship("MatchingSession", back_populates="user")
+    
+    # Personality ratings relationships
+    ratings_given = relationship("PersonalityRating", foreign_keys="PersonalityRating.rater_user_id", back_populates="rater")
+    ratings_received = relationship("PersonalityRating", foreign_keys="PersonalityRating.rated_user_id", back_populates="rated_user")
     
     # Video sessions - temporarily disabled to fix relationship issues
     # video_sessions = relationship("VideoSession", secondary=video_participants, back_populates="participants")
@@ -122,6 +138,7 @@ class Match(Base):
     # Relationships
     user = relationship("User", foreign_keys=[user_id], back_populates="sent_matches")
     matched_user = relationship("User", foreign_keys=[matched_user_id], back_populates="received_matches")
+    personality_ratings = relationship("PersonalityRating", back_populates="match")
 
 class VideoSession(Base):
     __tablename__ = "video_sessions"
@@ -139,7 +156,35 @@ class VideoSession(Base):
     # Participants
     participants = relationship("User", secondary="video_participants")
     
+    # Personality ratings for this session
+    personality_ratings = relationship("PersonalityRating", back_populates="video_session")
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class InstantCallSession(Base):
+    __tablename__ = "instant_call_sessions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, nullable=False)  # UUID for video session
+    user1_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user2_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Call status
+    status = Column(String, default="waiting")  # "waiting", "active", "completed", "cancelled"
+    call_completed = Column(Boolean, default=False)
+    
+    # Post-call decisions
+    user1_decision = Column(String, nullable=True)  # "like", "pass"
+    user2_decision = Column(String, nullable=True)  # "like", "pass"
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    call_started_at = Column(DateTime(timezone=True), nullable=True)
+    call_ended_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    user1 = relationship("User", foreign_keys=[user1_id])
+    user2 = relationship("User", foreign_keys=[user2_id])
 
 class MatchingSession(Base):
     __tablename__ = "matching_sessions"
@@ -169,6 +214,46 @@ class MatchingSession(Base):
     
     # Relationships
     user = relationship("User", back_populates="matching_sessions")
+
+
+class PersonalityRating(Base):
+    """Store personality ratings given by users after video calls"""
+    __tablename__ = "personality_ratings"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # Who gave the rating and who was rated
+    rater_user_id = Column(Integer, ForeignKey('users.id'), nullable=False)  # User giving the rating
+    rated_user_id = Column(Integer, ForeignKey('users.id'), nullable=False)  # User being rated
+    
+    # Optional: Link to specific video session/match that triggered this rating
+    video_session_id = Column(String, ForeignKey('video_sessions.session_id'), nullable=True)
+    match_id = Column(Integer, ForeignKey('matches.id'), nullable=True)
+    
+    # Personality trait ratings (1-10 scale)
+    friendliness = Column(Integer, nullable=False)        # How friendly/warm the person was
+    conversational_skills = Column(Integer, nullable=False)  # How good they were at conversation
+    sense_of_humor = Column(Integer, nullable=False)      # How funny/entertaining they were
+    intelligence = Column(Integer, nullable=False)        # How smart/insightful they seemed
+    attractiveness = Column(Integer, nullable=False)      # Physical/overall attractiveness
+    authenticity = Column(Integer, nullable=False)       # How genuine/authentic they seemed
+    respect_level = Column(Integer, nullable=False)      # How respectful they were
+    compatibility = Column(Integer, nullable=False)      # Overall compatibility feeling
+    
+    # Overall rating (average or separate)
+    overall_rating = Column(Float, nullable=False)       # Calculated or separate overall rating
+    
+    # Optional text feedback
+    written_feedback = Column(Text, nullable=True)       # Optional text comments
+    
+    # Metadata
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    rater = relationship("User", foreign_keys=[rater_user_id], back_populates="ratings_given")
+    rated_user = relationship("User", foreign_keys=[rated_user_id], back_populates="ratings_received")
+    video_session = relationship("VideoSession", back_populates="personality_ratings")
+    match = relationship("Match", back_populates="personality_ratings")
 
 
 # Association table for video session participants

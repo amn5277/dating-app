@@ -7,7 +7,14 @@ from dotenv import load_dotenv
 from database import engine, Base, User
 
 load_dotenv()
-Base.metadata.create_all(bind=engine)
+
+# Create database tables with error handling for resilient startup
+try:
+    Base.metadata.create_all(bind=engine)
+    print("✅ Database tables created successfully")
+except Exception as e:
+    print(f"⚠️ Warning: Could not create database tables during startup: {e}")
+    print("📝 Tables will be created when first database operation occurs")
 
 app = FastAPI(title="Video Dating App - Fixed", version="1.0.0")
 
@@ -63,13 +70,45 @@ try:
 except Exception as e:
     print(f"❌ Continuous matching router failed: {e}")
 
+try:
+    print("🔍 Importing personality ratings router...")
+    from routers import personality_ratings
+    app.include_router(personality_ratings.router, tags=["personality-ratings"])
+    print("✅ Personality ratings router included successfully")
+except Exception as e:
+    print(f"❌ Personality ratings router failed: {e}")
+
 @app.get("/")
 async def root():
     return {"message": "Video Dating App API - Fixed Version"}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "routers": ["auth", "profile", "matching", "video", "continuous-matching"]}
+    return {"status": "healthy", "routers": ["auth", "profile", "matching", "video", "continuous-matching"], "version": "v2.0-postgresql"}
+
+@app.get("/test-db")
+async def test_db():
+    """Test PostgreSQL database connection"""
+    try:
+        from database import engine
+        from sqlalchemy import text
+        
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT version()"))
+            db_version = result.fetchone()[0]
+            
+        return {
+            "status": "success",
+            "database": "postgresql",
+            "version": db_version.split()[0:2],  # PostgreSQL version info
+            "connection": "working"
+        }
+    except Exception as e:
+        return {
+            "status": "error", 
+            "database": "connection_failed",
+            "error": str(e)
+        }
 
 @app.get("/debug/users")
 async def debug_users():

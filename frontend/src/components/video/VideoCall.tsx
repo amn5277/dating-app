@@ -27,14 +27,24 @@ interface VideoSessionData {
 
 const VideoCall: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
-  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const { user } = useAuthStore();
+  const [searchParams] = useSearchParams();
   
   // Continuous matching parameters
   const isContinuousMatching = searchParams.get('continuous') === 'true';
   const continuousSessionId = searchParams.get('session_id');
   const matchId = searchParams.get('match_id');
+  
+  // ✅ DEBUG: Log all URL parameters
+  console.log('🔍 DEBUG: VideoCall URL parameters:', {
+    continuous: searchParams.get('continuous'),
+    session_id: searchParams.get('session_id'),
+    match_id: searchParams.get('match_id'),
+    isContinuousMatching,
+    continuousSessionId,
+    matchId
+  });
   
   // Video elements
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -58,6 +68,12 @@ const VideoCall: React.FC = () => {
   const [callEndedByMe, setCallEndedByMe] = useState(false);
   const [callEndedByOther, setCallEndedByOther] = useState(false);
   
+  // Track processed signals to prevent duplicates
+  const processedSignalsRef = useRef<Set<string>>(new Set());
+  
+  // Track if component is unmounting to prevent API calls
+  const isUnmountingRef = useRef(false);
+  
   // Continuous matching state
   const [showDecisionPopup, setShowDecisionPopup] = useState(false);
   const [matchData, setMatchData] = useState<any>(null);
@@ -71,6 +87,7 @@ const VideoCall: React.FC = () => {
     
     return () => {
       console.log('🏁 VideoCall component unmounting - running cleanup');
+      isUnmountingRef.current = true;
       cleanup();
     };
   }, [sessionId]);
@@ -88,7 +105,6 @@ const VideoCall: React.FC = () => {
           return prev - 1;
         });
       }, 1000);
-
       return () => clearInterval(timer);
     }
   }, [isCallStarted, timeLeft, callEndedByMe, callEndedByOther]);
@@ -96,8 +112,18 @@ const VideoCall: React.FC = () => {
   const initializeCall = async () => {
     try {
       // Get session data
-      if (!sessionId) return;
+      console.log('🎥 VideoCall - Initializing with sessionId:', sessionId);
+      console.log('🎥 VideoCall - isContinuousMatching:', isContinuousMatching);
+      console.log('🎥 VideoCall - continuousSessionId:', continuousSessionId);
+      console.log('🎥 VideoCall - matchId:', matchId);
       
+      if (!sessionId) {
+        console.error('❌ VideoCall - No sessionId provided!');
+        toast.error('Invalid video session');
+        return;
+      }
+      
+      console.log('🎥 VideoCall - Making API call to getSession:', sessionId);
       const response = await videoAPI.getSession(sessionId);
       setSessionData(response.data);
       
@@ -146,10 +172,29 @@ const VideoCall: React.FC = () => {
         }, 120000);
       }
     } catch (error: any) {
-      console.error('Failed to initialize call:', error);
+      console.error('❌ Failed to initialize call:', error);
+      console.error('❌ Error details:', {
+        message: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        url: error.config?.url,
+        method: error.config?.method,
+        sessionId: sessionId
+      });
       
       // Handle different types of errors with specific messages
-      if (error.message?.includes('HTTPS_REQUIRED')) {
+      const statusCode = error.response?.status;
+      if (statusCode === 404 || statusCode === 410 || statusCode === 403) {
+        const messages = {
+          404: 'Video session not found (404)',
+          410: 'Video session has ended (410)', 
+          403: 'Access denied to video session (403)'
+        };
+        toast.error(`${messages[statusCode as keyof typeof messages]}. Session ID: ${sessionId}`);
+        console.error(`❌ ${statusCode} Error - Session ended or not accessible:`, sessionId);
+        navigate('/dashboard');
+        return;
+      } else if (error.message?.includes('HTTPS_REQUIRED')) {
         toast.error('🔒 HTTPS Required: Camera access needs HTTPS for network connections. Please use localhost or enable HTTPS.', { duration: 8000 });
       } else if (error.message?.includes('Permission denied') || error.name === 'NotAllowedError') {
         toast.error('📷 Camera/Microphone Access Denied: Please allow camera and microphone access and try again.', { duration: 6000 });
@@ -177,18 +222,45 @@ const VideoCall: React.FC = () => {
     }
     
     sessionMonitorRef.current = setInterval(async () => {
-      if (callEndedByMe || callEndedByOther || !sessionId) {
-        return; // Don't monitor if call already ended
+      // ROBUST CHECK: Stop monitoring if call has ended by any means OR component is unmounting
+      if (callEndedByMe || callEndedByOther || !sessionId || isUnmountingRef.current) {
+        console.log('🛑 Stopping session monitoring - call already ended', { 
+          callEndedByMe, 
+          callEndedByOther, 
+          sessionId: !!sessionId 
+        });
+        if (sessionMonitorRef.current) {
+          clearInterval(sessionMonitorRef.current);
+          sessionMonitorRef.current = null;
+        }
+        return;
       }
       
       try {
+        console.log('🔍 Session monitoring check - calling API for session:', sessionId);
         const response = await videoAPI.getSession(sessionId);
         const currentSession = response.data;
+        
+        // DOUBLE-CHECK: Ensure call hasn't ended during API call
+        if (callEndedByMe || callEndedByOther || isUnmountingRef.current) {
+          console.log('🛑 Call ended during API call - stopping monitoring');
+          if (sessionMonitorRef.current) {
+            clearInterval(sessionMonitorRef.current);
+            sessionMonitorRef.current = null;
+          }
+          return;
+        }
         
         // Check if session was ended by the other user
         if (currentSession.status === 'completed' && !callEndedByMe) {
           console.log('🛑 Call ended by other user - terminating immediately');
           setCallEndedByOther(true);
+          
+          // Clear monitoring immediately to prevent further API calls
+          if (sessionMonitorRef.current) {
+            clearInterval(sessionMonitorRef.current);
+            sessionMonitorRef.current = null;
+          }
           
           // Show immediate notification
           toast('📞 Call ended by the other user', { 
@@ -205,15 +277,42 @@ const VideoCall: React.FC = () => {
           return;
         }
         
-        // Update session data
-        setSessionData(currentSession);
+        // Update session data only if call is still active
+        if (!callEndedByMe && !callEndedByOther) {
+          setSessionData(currentSession);
+        }
         
       } catch (error: any) {
         console.error('Error monitoring session:', error);
-        // If session not found, it might have been ended
-        if (error.response?.status === 404 && !callEndedByMe) {
-          console.log('🛑 Session not found - call likely ended by other user');
+        
+        // DOUBLE-CHECK: Ensure call hasn't ended during error handling
+        if (callEndedByMe || callEndedByOther || isUnmountingRef.current) {
+          console.log('🛑 Call ended during error handling - stopping monitoring');
+          if (sessionMonitorRef.current) {
+            clearInterval(sessionMonitorRef.current);
+            sessionMonitorRef.current = null;
+          }
+          return;
+        }
+        
+        // Handle all "call ended" status codes
+        const statusCode = error.response?.status;
+        if ((statusCode === 404 || statusCode === 410 || statusCode === 403) && !callEndedByMe) {
+          console.log(`🛑 Session API returned ${statusCode} - call ended by other user or session expired`);
           setCallEndedByOther(true);
+          
+          // IMMEDIATELY clear monitoring to prevent further API calls
+          if (sessionMonitorRef.current) {
+            clearInterval(sessionMonitorRef.current);
+            sessionMonitorRef.current = null;
+          }
+          
+          // Clear signaling too
+          if (signalingIntervalRef.current) {
+            clearInterval(signalingIntervalRef.current);
+            signalingIntervalRef.current = null;
+          }
+          
           handleRemoteCallEnd();
         }
       }
@@ -222,21 +321,104 @@ const VideoCall: React.FC = () => {
 
   const handleRemoteCallEnd = async () => {
     console.log('🛑 Handling remote call termination...');
+    console.log('🔄 Continuous matching params:', { 
+      isContinuousMatching, 
+      continuousSessionId, 
+      matchId,
+      sessionData: sessionData?.match_id 
+    });
     
-    // Clear monitoring
+    // ✅ CRITICAL DEBUGGING: Check which match_id to use for skip decision
+    const urlMatchId = matchId;
+    const sessionMatchId = sessionData?.match_id;
+    
+    console.log('🔍 MATCH ID DEBUGGING:', {
+      urlMatchId: urlMatchId,
+      sessionMatchId: sessionMatchId,
+      urlMatchIdType: typeof urlMatchId,
+      sessionMatchIdType: typeof sessionMatchId,
+      urlMatchIdParsed: urlMatchId ? parseInt(urlMatchId) : null,
+      whichToUse: sessionMatchId || (urlMatchId ? parseInt(urlMatchId) : null)
+    });
+    
+    // ✅ CRITICAL DEBUGGING: Check why continuousSessionId might be undefined
+    if (isContinuousMatching && (!continuousSessionId || continuousSessionId === 'undefined')) {
+      console.error('❌ CRITICAL: Continuous matching enabled but sessionId is undefined!');
+      console.error('❌ URL parameters:', {
+        continuous: searchParams.get('continuous'),
+        session_id: searchParams.get('session_id'),
+        match_id: searchParams.get('match_id'),
+        all_params: Object.fromEntries(searchParams.entries())
+      });
+      console.error('❌ This will break the return to continuous matching flow');
+    }
+    
+    // Mark call as ended to prevent further API calls
+    if (!callEndedByOther) {
+      setCallEndedByOther(true);
+    }
+    
+    // Immediately clear ALL monitoring and signaling
     if (sessionMonitorRef.current) {
+      console.log('🛑 Clearing session monitoring interval in handleRemoteCallEnd');
       clearInterval(sessionMonitorRef.current);
       sessionMonitorRef.current = null;
+    }
+    
+    if (signalingIntervalRef.current) {
+      console.log('🛑 Clearing signaling interval in handleRemoteCallEnd');
+      clearInterval(signalingIntervalRef.current);
+      signalingIntervalRef.current = null;
     }
     
     // Cleanup WebRTC connections
     cleanup();
     
-    // Navigate with specific message for remote termination
+    // Handle navigation based on context
     setTimeout(() => {
-      if (sessionData?.match_id) {
+      if (isContinuousMatching && continuousSessionId && continuousSessionId !== 'undefined') {
+        console.log('🔄 Returning to continuous matching after remote call end');
+        
+        // ✅ CRITICAL FIX: Use correct match_id for skip decision
+        const matchIdToSkip = sessionMatchId || (urlMatchId ? parseInt(urlMatchId) : null);
+        
+        console.log('🔍 SKIP DECISION MATCH ID:', {
+          sessionMatchId,
+          urlMatchId,
+          urlMatchIdParsed: urlMatchId ? parseInt(urlMatchId) : null,
+          finalMatchIdToSkip: matchIdToSkip
+        });
+        
+        // If we have match data, record the decision as "skip" since they left
+        if (matchIdToSkip && matchIdToSkip > 0) {
+          console.log('📝 Recording skip decision for user who left. Match ID:', matchIdToSkip);
+          const skipUrl = `/continuous-matching?session_id=${continuousSessionId}&action=skip&skipped_match=${matchIdToSkip}`;
+          console.log('📝 Navigation URL will be:', skipUrl);
+          console.log('📝 NAVIGATING NOW to continuous matching with skip action...');
+          // Navigate back to continuous matching with skip action
+          navigate(skipUrl);
+          console.log('✅ NAVIGATION COMPLETED to:', skipUrl);
+        } else {
+          console.log('⚠️ No valid match_id for skip decision. SessionData match_id:', sessionData?.match_id, 'URL match_id:', urlMatchId);
+          console.log('🔄 Returning to continuous matching to find next match (no skip)');
+          const nextUrl = `/continuous-matching?session_id=${continuousSessionId}&action=next`;
+          console.log('📝 Navigation URL will be:', nextUrl);
+          navigate(nextUrl);
+          console.log('✅ NAVIGATION COMPLETED to:', nextUrl);
+        }
+      } else if (isContinuousMatching && (!continuousSessionId || continuousSessionId === 'undefined')) {
+        // ✅ FALLBACK: Continuous matching enabled but no session ID - return to continuous matching home
+        console.log('⚠️ FALLBACK: Continuous matching enabled but no session ID');
+        console.log('⚠️ Returning to continuous matching interface to start new session');
+        toast.error('Session lost - please start a new continuous matching session', { duration: 4000 });
+        navigate('/continuous-matching');
+      } else if (sessionData?.match_id) {
+        // Regular matching flow - go to swipe decision
+        console.log('📝 Going to swipe decision for regular match');
         navigate(`/swipe/${sessionData.match_id}`);
       } else {
+        // Fallback to dashboard
+        console.log('🏠 Fallback navigation to dashboard');
         navigate('/dashboard');
       }
     }, 2000); // Give user time to see the message
@@ -258,20 +440,24 @@ const VideoCall: React.FC = () => {
         audio: true,
       });
 
-      toast.success('Camera and microphone access granted!', { id: 'media-access' });
-      console.log('✅ Media access granted successfully');
-      
       localStreamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
 
-      // Create peer connection
+      toast.success('Camera and microphone access granted!', { id: 'media-access' });
+      console.log('✅ Media access granted successfully');
+      
+      // Create peer connection with better STUN/TURN servers
       const configuration: RTCConfiguration = {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
         ],
+        iceCandidatePoolSize: 10,
       };
 
       const peerConnection = new RTCPeerConnection(configuration);
@@ -288,8 +474,8 @@ const VideoCall: React.FC = () => {
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream;
         }
-        setConnectionStatus('connected');
         setIsConnected(true);
+        setConnectionStatus('connected');
       };
 
       // Handle ICE candidates
@@ -311,16 +497,41 @@ const VideoCall: React.FC = () => {
       // Handle connection state changes
       peerConnection.onconnectionstatechange = () => {
         const state = peerConnection.connectionState;
+        console.log(`🔗 Peer connection state changed: ${state}`);
+        
         if (state === 'connected') {
+          console.log('✅ Peer connection established successfully!');
           setConnectionStatus('connected');
           setIsConnected(true);
-        } else if (state === 'disconnected' || state === 'failed') {
+          toast.success('Video connection established!', { duration: 2000 });
+        } else if (state === 'disconnected') {
+          console.log('⚠️ Peer connection disconnected');
           setConnectionStatus('disconnected');
           setIsConnected(false);
+        } else if (state === 'failed') {
+          console.log('❌ Peer connection failed');
+          setConnectionStatus('disconnected');
+          setIsConnected(false);
+          toast.error('Video connection failed. Please check your network.', { duration: 3000 });
+        } else if (state === 'connecting') {
+          console.log('🔄 Peer connection attempting to connect...');
+          setConnectionStatus('connecting');
         }
       };
 
-    } catch (error) {
+      // Handle ICE connection state changes for additional debugging
+      peerConnection.oniceconnectionstatechange = () => {
+        const iceState = peerConnection.iceConnectionState;
+        console.log(`🧊 ICE connection state: ${iceState}`);
+        
+        if (iceState === 'failed' || iceState === 'disconnected') {
+          console.log('❄️ ICE connection issues detected');
+          toast.error('Network connection issues detected', { duration: 2000 });
+        }
+      };
+
+      console.log('✅ WebRTC setup completed');
+    } catch (error: any) {
       console.error('Failed to setup WebRTC:', error);
       
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -347,15 +558,24 @@ const VideoCall: React.FC = () => {
     console.log('🎯 Starting signaling for session:', sessionId);
     
     let pollCount = 0;
-    const maxPolls = 30; // Stop after 60 seconds (30 * 2s intervals)
+    const maxPolls = 60; // Stop after 120 seconds (60 * 2s intervals)
 
     // Poll for WebRTC signals
     const pollSignals = async () => {
       pollCount++;
       console.log(`📡 Polling signals #${pollCount} for session: ${sessionId}`);
       
-      if (!sessionId || !isCallStarted) {
-        console.log('⚠️ Stopping polling - no session or call not started');
+      // ROBUST CHECK: Stop polling if call has ended OR component is unmounting
+      if (callEndedByMe || callEndedByOther || !sessionId || isUnmountingRef.current) {
+        console.log('🛑 Stopping signaling polling - call ended', { 
+          callEndedByMe, 
+          callEndedByOther, 
+          sessionId: !!sessionId 
+        });
+        if (signalingIntervalRef.current) {
+          clearInterval(signalingIntervalRef.current);
+          signalingIntervalRef.current = null;
+        }
         return;
       }
       
@@ -381,6 +601,17 @@ const VideoCall: React.FC = () => {
       
       try {
         const response = await videoAPI.getSignals(sessionId);
+        
+        // DOUBLE-CHECK: Ensure call hasn't ended during API call
+        if (callEndedByMe || callEndedByOther || isUnmountingRef.current) {
+          console.log('🛑 Call ended during signaling API call - stopping polling');
+          if (signalingIntervalRef.current) {
+            clearInterval(signalingIntervalRef.current);
+            signalingIntervalRef.current = null;
+          }
+          return;
+        }
+        
         const signals = response.data.signals;
         
         if (signals.length > 0) {
@@ -388,18 +619,58 @@ const VideoCall: React.FC = () => {
         }
         
         for (const signal of signals) {
+          // Check again before processing each signal
+          if (callEndedByMe || callEndedByOther || isUnmountingRef.current) {
+            console.log('🛑 Call ended during signal processing - stopping');
+            if (signalingIntervalRef.current) {
+              clearInterval(signalingIntervalRef.current);
+              signalingIntervalRef.current = null;
+            }
+            return;
+          }
+          
+          // Add a small delay between processing signals to prevent race conditions
+          await new Promise(resolve => setTimeout(resolve, 50));
           await handleSignal(signal);
         }
       } catch (error: any) {
         console.error('❌ Failed to get signals:', error);
         
-        // Stop polling if rate limited (429) or unauthorized (401)
-        if (error.response?.status === 429 || error.response?.status === 401) {
-          console.log('🛑 Stopping polling due to rate limit or unauthorized access');
+        // DOUBLE-CHECK: Ensure call hasn't ended during error handling
+        if (callEndedByMe || callEndedByOther || isUnmountingRef.current) {
+          console.log('🛑 Call ended during signaling error handling - stopping polling');
           if (signalingIntervalRef.current) {
             clearInterval(signalingIntervalRef.current);
             signalingIntervalRef.current = null;
           }
+          return;
+        }
+        
+        // Stop polling for "call ended" status codes
+        const statusCode = error.response?.status;
+        if (statusCode === 404 || statusCode === 410 || statusCode === 403 || statusCode === 429 || statusCode === 401) {
+          if (statusCode === 404 || statusCode === 410 || statusCode === 403) {
+            console.log(`🛑 Signaling API returned ${statusCode} - session ended, stopping all polling`);
+            // Mark call as ended by other user if not already ended by this user
+            if (!callEndedByMe) {
+              setCallEndedByOther(true);
+            }
+          } else {
+            console.log(`🛑 Stopping signaling polling due to ${statusCode === 429 ? 'rate limit' : 'unauthorized access'}`);
+          }
+          
+          // Clear signaling polling
+          if (signalingIntervalRef.current) {
+            clearInterval(signalingIntervalRef.current);
+            signalingIntervalRef.current = null;
+          }
+          
+          // Clear session monitoring too if session ended
+          if ((statusCode === 404 || statusCode === 410 || statusCode === 403) && sessionMonitorRef.current) {
+            clearInterval(sessionMonitorRef.current);
+            sessionMonitorRef.current = null;
+          }
+          
           return;
         }
         
@@ -412,16 +683,43 @@ const VideoCall: React.FC = () => {
     console.log('🔄 Setting up signaling interval (2s)');
     signalingIntervalRef.current = setInterval(pollSignals, 2000);
     
-    // Create offer if we're the initiator
-    setTimeout(createOffer, 2000);
+    // Create offer only if we're the initiator (lower user ID creates first offer to avoid collisions)
+    setTimeout(() => {
+      if (user && sessionData) {
+        const shouldCreateOffer = shouldBeInitiator();
+        if (shouldCreateOffer) {
+          console.log('📤 This user will initiate the offer (lower ID)');
+          createOffer();
+        } else {
+          console.log('⏳ Waiting for the other user to send offer (higher ID)');
+        }
+      } else {
+        // Fallback: create offer if we don't have user data
+        createOffer();
+      }
+    }, 2000);
   };
 
   const createOffer = async () => {
     if (!peerConnectionRef.current || !sessionId) return;
+    
+    const pc = peerConnectionRef.current;
+    
+    // Only create offer if we're in stable state and don't already have a local description
+    if (pc.signalingState !== 'stable') {
+      console.log(`⚠️ Skipping offer creation, not in stable state: ${pc.signalingState}`);
+      return;
+    }
 
     try {
-      const offer = await peerConnectionRef.current.createOffer();
-      await peerConnectionRef.current.setLocalDescription(offer);
+      console.log('📤 Creating WebRTC offer...');
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      });
+      
+      await pc.setLocalDescription(offer);
+      console.log('📤 Local description set, sending offer...');
       
       await videoAPI.sendSignal({
         type: 'offer',
@@ -429,44 +727,125 @@ const VideoCall: React.FC = () => {
         target_user_id: 0, // Will be set by backend
         session_id: sessionId,
       });
+      
+      console.log('✅ Offer sent successfully');
     } catch (error) {
-      console.error('Failed to create offer:', error);
+      console.error('❌ Failed to create offer:', error);
+      toast.error('Failed to initiate video connection', { duration: 3000 });
     }
   };
 
   const handleSignal = async (signal: any) => {
-    if (!peerConnectionRef.current) return;
+    if (!peerConnectionRef.current) {
+      console.warn('⚠️ No peer connection available to handle signal:', signal.type);
+      return;
+    }
+
+    // Create unique signal ID to prevent duplicate processing
+    const signalId = `${signal.type}-${signal.from_user_id}-${signal.timestamp || Date.now()}`;
+    
+    if (processedSignalsRef.current.has(signalId)) {
+      console.log(`🔄 Skipping duplicate signal: ${signal.type} from user ${signal.from_user_id}`);
+      return;
+    }
+    
+    processedSignalsRef.current.add(signalId);
+
+    const pc = peerConnectionRef.current;
+    const currentState = pc.signalingState;
 
     try {
+      console.log(`📨 Processing WebRTC signal: ${signal.type} from user ${signal.from_user_id}, current state: ${currentState}`);
+      
       switch (signal.type) {
         case 'offer':
-          await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(signal.data));
-          const answer = await peerConnectionRef.current.createAnswer();
-          await peerConnectionRef.current.setLocalDescription(answer);
-          
-          if (sessionId) {
-            await videoAPI.sendSignal({
-              type: 'answer',
-              data: answer,
-              target_user_id: signal.from_user_id,
-              session_id: sessionId,
-            });
+          // Handle offer collision - if we're in have-local-offer, we need to decide who backs down
+          if (currentState === 'have-local-offer') {
+            console.log('🔄 Offer collision detected! Implementing polite peer pattern...');
+            
+            // Use user ID to determine who should back down (higher ID backs down)
+            const shouldBackDown = user && user.id > signal.from_user_id;
+            
+            if (shouldBackDown) {
+              console.log('🔄 Backing down from offer collision, processing remote offer...');
+              // Back down: rollback our offer and accept theirs
+              await pc.setLocalDescription({type: 'rollback', sdp: ''} as RTCSessionDescriptionInit);
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              
+              if (sessionId) {
+                console.log('📤 Sending answer after backing down...');
+                await videoAPI.sendSignal({
+                  type: 'answer',
+                  data: answer,
+                  target_user_id: signal.from_user_id,
+                  session_id: sessionId,
+                });
+                console.log('✅ Answer sent after collision resolution');
+              }
+            } else {
+              console.log('🛑 Ignoring remote offer (we have priority in collision)');
+            }
+          } else if (currentState === 'stable') {
+            console.log('📤 Received offer in stable state, creating answer...');
+            await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            if (sessionId) {
+              console.log('📤 Sending answer back...');
+              await videoAPI.sendSignal({
+                type: 'answer',
+                data: answer,
+                target_user_id: signal.from_user_id,
+                session_id: sessionId,
+              });
+              console.log('✅ Answer sent successfully');
+            }
+          } else {
+            console.warn(`⚠️ Ignoring offer in state: ${currentState}`);
           }
           break;
           
         case 'answer':
-          await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(signal.data));
+          // Only process answer if we're expecting one (have-local-offer state)
+          if (currentState === 'have-local-offer') {
+            console.log('📥 Received answer, setting remote description...');
+            // Double-check state hasn't changed during async operations
+            if (pc.signalingState === 'have-local-offer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+              console.log('✅ Answer processed successfully');
+            } else {
+              console.warn(`⚠️ State changed during answer processing: ${pc.signalingState}`);
+            }
+          } else {
+            console.warn(`⚠️ Ignoring answer in state: ${currentState} (expected: have-local-offer)`);
+            // Remove from processed set so it can be retried if state changes
+            processedSignalsRef.current.delete(signalId);
+          }
           break;
           
         case 'ice-candidate':
-          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(signal.data));
+          // ICE candidates can be processed in most states, but check if we have remote description
+          if (pc.remoteDescription) {
+            console.log('🧊 Received ICE candidate, adding to peer connection...');
+            await pc.addIceCandidate(new RTCIceCandidate(signal.data));
+            console.log('✅ ICE candidate added successfully');
+          } else {
+            console.warn('🧊 ICE candidate received but no remote description set yet, ignoring');
+          }
           break;
           
         default:
-          console.warn('Unknown signal type:', signal.type);
+          console.warn('❓ Unknown signal type:', signal.type);
       }
     } catch (error) {
-      console.error('Failed to handle signal:', error);
+      console.error(`❌ Failed to handle ${signal.type} signal:`, error);
+      
+      // Provide user feedback for critical errors
+      if (signal.type === 'offer' || signal.type === 'answer') {
+        toast.error(`WebRTC ${signal.type} processing failed. Connection may not work properly.`, { duration: 3000 });
+      }
     }
   };
 
@@ -501,10 +880,17 @@ const VideoCall: React.FC = () => {
     console.log('🛑 Call ending...', { isTimerExpired, isContinuousMatching });
     setCallEndedByMe(true); // Mark that this user ended the call
     
-    // Clear session monitoring immediately
+    // IMMEDIATELY clear ALL intervals to prevent further API calls
     if (sessionMonitorRef.current) {
+      console.log('🛑 Clearing session monitoring interval in endCall');
       clearInterval(sessionMonitorRef.current);
       sessionMonitorRef.current = null;
+    }
+    
+    if (signalingIntervalRef.current) {
+      console.log('🛑 Clearing signaling interval in endCall');
+      clearInterval(signalingIntervalRef.current);
+      signalingIntervalRef.current = null;
     }
     
     try {
@@ -516,9 +902,8 @@ const VideoCall: React.FC = () => {
       cleanup();
       
       // Handle continuous matching flow
-      if (isContinuousMatching && isTimerExpired && matchId && continuousSessionId) {
+      if (isContinuousMatching && isTimerExpired && matchId && continuousSessionId && continuousSessionId !== 'undefined') {
         console.log('🔄 Timer expired in continuous matching - showing decision popup');
-        
         // Load match data for the popup
         try {
           const matches = await matchingAPI.getMatches();
@@ -539,12 +924,50 @@ const VideoCall: React.FC = () => {
         } catch (error) {
           console.error('Failed to load match data:', error);
         }
+      } else if (isContinuousMatching && isTimerExpired && (!continuousSessionId || continuousSessionId === 'undefined')) {
+        // ✅ FALLBACK: Timer expired in continuous matching but no session ID
+        console.log('⚠️ FALLBACK: Timer expired in continuous matching but no session ID');
+        console.log('⚠️ Returning to continuous matching interface');
+        toast.error('Session lost - returning to continuous matching', { duration: 4000 });
+        navigate('/continuous-matching');
+        return;
       }
       
+      // ✅ CRITICAL FIX: Handle manual end call in continuous matching
+      if (isContinuousMatching && !isTimerExpired && continuousSessionId && continuousSessionId !== 'undefined') {
+        console.log('🔄 User manually ended call in continuous matching - applying skip decision');
+        
+        // Get correct match ID for skip decision
+        const urlMatchId = matchId;
+        const sessionMatchId = sessionData?.match_id;
+        const matchIdToSkip = sessionMatchId || (urlMatchId ? parseInt(urlMatchId) : null);
+        
+        console.log('🔍 MANUAL END CALL SKIP DECISION:', {
+          sessionMatchId,
+          urlMatchId,
+          finalMatchIdToSkip: matchIdToSkip,
+          continuousSessionId
+        });
+        
+        // Apply skip decision since user manually ended the call
+        if (matchIdToSkip && matchIdToSkip > 0) {
+          console.log('📝 Recording skip decision for manually ended call. Match ID:', matchIdToSkip);
+          const skipUrl = `/continuous-matching?session_id=${continuousSessionId}&action=skip&skipped_match=${matchIdToSkip}`;
+          console.log('📝 Manual end call navigation URL:', skipUrl);
+          navigate(skipUrl);
+          console.log('✅ Manual end call navigation completed with skip action');
+        } else {
+          console.log('⚠️ No valid match_id for manual end call skip decision');
+          const nextUrl = `/continuous-matching?session_id=${continuousSessionId}&action=next`;
+          console.log('📝 Fallback navigation URL:', nextUrl);
+          navigate(nextUrl);
+        }
+      }
       // Regular flow or fallback
-      if (sessionData?.match_id && !isContinuousMatching) {
+      else if (sessionData?.match_id && !isContinuousMatching) {
         navigate(`/swipe/${sessionData.match_id}`);
       } else if (isContinuousMatching) {
+        console.log('🔄 Fallback: Basic navigation to continuous matching (no session ID or timer expired case)');
         navigate('/continuous-matching');
       } else {
         navigate('/dashboard');
@@ -573,6 +996,10 @@ const VideoCall: React.FC = () => {
       sessionMonitorRef.current = null;
     }
     
+    // Clear processed signals
+    console.log('🧹 Clearing processed signals');
+    processedSignalsRef.current.clear();
+    
     // Stop local stream
     if (localStreamRef.current) {
       console.log('📹 Stopping local stream tracks');
@@ -588,6 +1015,13 @@ const VideoCall: React.FC = () => {
     }
     
     console.log('✅ VideoCall cleanup complete');
+  };
+
+  const shouldBeInitiator = () => {
+    // Determine if this user should create the initial offer
+    // Use a simple deterministic approach: user with ID ending in even number creates offer
+    if (!user) return true; // Fallback
+    return user.id % 2 === 0;
   };
 
   const formatTime = (seconds: number) => {
@@ -853,7 +1287,7 @@ const VideoCall: React.FC = () => {
       </AnimatePresence>
 
       {/* Post-Call Decision Popup for Continuous Matching */}
-      {showDecisionPopup && matchData && continuousSessionId && (
+      {showDecisionPopup && matchData && continuousSessionId && continuousSessionId !== 'undefined' && (
         <PostCallDecisionPopup
           isOpen={showDecisionPopup}
           matchData={matchData}

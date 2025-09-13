@@ -238,7 +238,7 @@ const Dashboard: React.FC = () => {
             className="bg-gradient-to-r from-pink-500 to-purple-600 hover:from-pink-600 hover:to-purple-700 text-white font-bold py-3 px-6 rounded-lg flex items-center justify-center transition-all duration-200 shadow-lg"
           >
             <VideoCameraIcon className="h-5 w-5 mr-2" />
-            🎯 Start Matching
+            🎯 Instant Match & Chat
           </Link>
 
           <Link to="/matching" className="btn-secondary flex items-center justify-center">
